@@ -35,9 +35,7 @@
 #include "scene/main/viewport.h"
 #include "scene/resources/curve_texture.h"
 #include "scene/resources/gradient_texture.h"
-#include "scene/resources/image_texture.h"
 #include "scene/resources/particle_process_material.h"
-#include "scene/scene_string_names.h"
 
 AABB CPUParticles3D::get_aabb() const {
 	return AABB();
@@ -69,7 +67,7 @@ void CPUParticles3D::set_amount(int p_amount) {
 
 		for (int i = 0; i < p_amount; i++) {
 			w[i].active = false;
-			w[i].custom[3] = 0.0; // Make sure w component isn't garbage data
+			w[i].custom[3] = 1.0; // Make sure w component isn't garbage data and doesn't break shaders with CUSTOM.y/Custom.w
 		}
 	}
 
@@ -99,6 +97,12 @@ void CPUParticles3D::set_explosiveness_ratio(real_t p_ratio) {
 
 void CPUParticles3D::set_randomness_ratio(real_t p_ratio) {
 	randomness_ratio = p_ratio;
+}
+
+void CPUParticles3D::set_visibility_aabb(const AABB &p_aabb) {
+	RS::get_singleton()->multimesh_set_custom_aabb(multimesh, p_aabb);
+	visibility_aabb = p_aabb;
+	update_gizmos();
 }
 
 void CPUParticles3D::set_lifetime_randomness(double p_random) {
@@ -139,6 +143,10 @@ real_t CPUParticles3D::get_explosiveness_ratio() const {
 
 real_t CPUParticles3D::get_randomness_ratio() const {
 	return randomness_ratio;
+}
+
+AABB CPUParticles3D::get_visibility_aabb() const {
+	return visibility_aabb;
 }
 
 double CPUParticles3D::get_lifetime_randomness() const {
@@ -301,7 +309,7 @@ real_t CPUParticles3D::get_param_max(Parameter p_param) const {
 
 static void _adjust_curve_range(const Ref<Curve> &p_curve, real_t p_min, real_t p_max) {
 	Ref<Curve> curve = p_curve;
-	if (!curve.is_valid()) {
+	if (curve.is_null()) {
 		return;
 	}
 
@@ -439,6 +447,10 @@ void CPUParticles3D::set_emission_ring_inner_radius(real_t p_radius) {
 	emission_ring_inner_radius = p_radius;
 }
 
+void CPUParticles3D::set_emission_ring_cone_angle(real_t p_angle) {
+	emission_ring_cone_angle = p_angle;
+}
+
 void CPUParticles3D::set_scale_curve_x(Ref<Curve> p_scale_curve) {
 	scale_curve_x = p_scale_curve;
 }
@@ -492,6 +504,10 @@ real_t CPUParticles3D::get_emission_ring_inner_radius() const {
 	return emission_ring_inner_radius;
 }
 
+real_t CPUParticles3D::get_emission_ring_cone_angle() const {
+	return emission_ring_cone_angle;
+}
+
 CPUParticles3D::EmissionShape CPUParticles3D::get_emission_shape() const {
 	return emission_shape;
 }
@@ -520,7 +536,16 @@ bool CPUParticles3D::get_split_scale() {
 	return split_scale;
 }
 
+AABB CPUParticles3D::capture_aabb() const {
+	RS::get_singleton()->multimesh_set_custom_aabb(multimesh, AABB());
+	return RS::get_singleton()->multimesh_get_aabb(multimesh);
+}
+
 void CPUParticles3D::_validate_property(PropertyInfo &p_property) const {
+	if (p_property.name == "emitting") {
+		p_property.hint = one_shot ? PROPERTY_HINT_ONESHOT : PROPERTY_HINT_NONE;
+	}
+
 	if (p_property.name == "emission_sphere_radius" && (emission_shape != EMISSION_SHAPE_SPHERE && emission_shape != EMISSION_SHAPE_SPHERE_SURFACE)) {
 		p_property.usage = PROPERTY_USAGE_NONE;
 	}
@@ -798,9 +823,10 @@ void CPUParticles3D::_particles_process(double p_delta) {
 			p.custom[0] = Math::deg_to_rad(base_angle); //angle
 			p.custom[1] = 0.0; //phase
 			p.custom[2] = tex_anim_offset * Math::lerp(parameters_min[PARAM_ANIM_OFFSET], parameters_max[PARAM_ANIM_OFFSET], p.anim_offset_rand); //animation offset (0-1)
+			p.custom[3] = (1.0 - Math::randf() * lifetime_randomness);
 			p.transform = Transform3D();
 			p.time = 0;
-			p.lifetime = lifetime * (1.0 - Math::randf() * lifetime_randomness);
+			p.lifetime = lifetime * p.custom[3];
 			p.base_color = Color(1, 1, 1, 1);
 
 			switch (emission_shape) {
@@ -863,11 +889,17 @@ void CPUParticles3D::_particles_process(double p_delta) {
 					}
 				} break;
 				case EMISSION_SHAPE_RING: {
+					real_t radius_clamped = MAX(0.001, emission_ring_radius);
+					real_t top_radius = MAX(radius_clamped - Math::tan(Math::deg_to_rad(90.0 - emission_ring_cone_angle)) * emission_ring_height, 0.0);
+					real_t y_pos = Math::randf();
+					real_t skew = MAX(MIN(radius_clamped, top_radius) / MAX(radius_clamped, top_radius), 0.5);
+					y_pos = radius_clamped < top_radius ? Math::pow(y_pos, skew) : 1.0 - Math::pow(y_pos, skew);
 					real_t ring_random_angle = Math::randf() * Math_TAU;
-					real_t ring_random_radius = Math::randf() * (emission_ring_radius - emission_ring_inner_radius) + emission_ring_inner_radius;
-					Vector3 axis = emission_ring_axis.normalized();
+					real_t ring_random_radius = Math::sqrt(Math::randf() * (radius_clamped * radius_clamped - emission_ring_inner_radius * emission_ring_inner_radius) + emission_ring_inner_radius * emission_ring_inner_radius);
+					ring_random_radius = Math::lerp(ring_random_radius, ring_random_radius * (top_radius / radius_clamped), y_pos);
+					Vector3 axis = emission_ring_axis == Vector3(0.0, 0.0, 0.0) ? Vector3(0.0, 0.0, 1.0) : emission_ring_axis.normalized();
 					Vector3 ortho_axis;
-					if (axis == Vector3(1.0, 0.0, 0.0)) {
+					if (axis.abs() == Vector3(1.0, 0.0, 0.0)) {
 						ortho_axis = Vector3(0.0, 1.0, 0.0).cross(axis);
 					} else {
 						ortho_axis = Vector3(1.0, 0.0, 0.0).cross(axis);
@@ -875,7 +907,7 @@ void CPUParticles3D::_particles_process(double p_delta) {
 					ortho_axis = ortho_axis.normalized();
 					ortho_axis.rotate(axis, ring_random_angle);
 					ortho_axis = ortho_axis.normalized();
-					p.transform.origin = ortho_axis * ring_random_radius + (Math::randf() * emission_ring_height - emission_ring_height / 2.0) * axis;
+					p.transform.origin = ortho_axis * ring_random_radius + (y_pos * emission_ring_height - emission_ring_height / 2.0) * axis;
 				} break;
 				case EMISSION_SHAPE_MAX: { // Max value for validity check.
 					break;
@@ -1109,7 +1141,7 @@ void CPUParticles3D::_particles_process(double p_delta) {
 			//turn particle by rotation in Y
 			if (particle_flags[PARTICLE_FLAG_ROTATE_Y]) {
 				Basis rot_y(Vector3(0, 1, 0), p.custom[0]);
-				p.transform.basis = p.transform.basis * rot_y;
+				p.transform.basis = rot_y;
 			}
 		}
 
@@ -1140,7 +1172,7 @@ void CPUParticles3D::_particles_process(double p_delta) {
 	}
 	if (!Math::is_equal_approx(time, 0.0) && active && !should_be_active) {
 		active = false;
-		emit_signal(SceneStringNames::get_singleton()->finished);
+		emit_signal(SceneStringName(finished));
 	}
 }
 
@@ -1341,6 +1373,7 @@ void CPUParticles3D::convert_from_particles(Node *p_particles) {
 	set_pre_process_time(gpu_particles->get_pre_process_time());
 	set_explosiveness_ratio(gpu_particles->get_explosiveness_ratio());
 	set_randomness_ratio(gpu_particles->get_randomness_ratio());
+	set_visibility_aabb(gpu_particles->get_visibility_aabb());
 	set_use_local_coordinates(gpu_particles->get_use_local_coordinates());
 	set_fixed_fps(gpu_particles->get_fixed_fps());
 	set_fractional_delta(gpu_particles->get_fractional_delta());
@@ -1420,6 +1453,7 @@ void CPUParticles3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_pre_process_time", "secs"), &CPUParticles3D::set_pre_process_time);
 	ClassDB::bind_method(D_METHOD("set_explosiveness_ratio", "ratio"), &CPUParticles3D::set_explosiveness_ratio);
 	ClassDB::bind_method(D_METHOD("set_randomness_ratio", "ratio"), &CPUParticles3D::set_randomness_ratio);
+	ClassDB::bind_method(D_METHOD("set_visibility_aabb", "aabb"), &CPUParticles3D::set_visibility_aabb);
 	ClassDB::bind_method(D_METHOD("set_lifetime_randomness", "random"), &CPUParticles3D::set_lifetime_randomness);
 	ClassDB::bind_method(D_METHOD("set_use_local_coordinates", "enable"), &CPUParticles3D::set_use_local_coordinates);
 	ClassDB::bind_method(D_METHOD("set_fixed_fps", "fps"), &CPUParticles3D::set_fixed_fps);
@@ -1433,6 +1467,7 @@ void CPUParticles3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pre_process_time"), &CPUParticles3D::get_pre_process_time);
 	ClassDB::bind_method(D_METHOD("get_explosiveness_ratio"), &CPUParticles3D::get_explosiveness_ratio);
 	ClassDB::bind_method(D_METHOD("get_randomness_ratio"), &CPUParticles3D::get_randomness_ratio);
+	ClassDB::bind_method(D_METHOD("get_visibility_aabb"), &CPUParticles3D::get_visibility_aabb);
 	ClassDB::bind_method(D_METHOD("get_lifetime_randomness"), &CPUParticles3D::get_lifetime_randomness);
 	ClassDB::bind_method(D_METHOD("get_use_local_coordinates"), &CPUParticles3D::get_use_local_coordinates);
 	ClassDB::bind_method(D_METHOD("get_fixed_fps"), &CPUParticles3D::get_fixed_fps);
@@ -1447,13 +1482,14 @@ void CPUParticles3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_mesh"), &CPUParticles3D::get_mesh);
 
 	ClassDB::bind_method(D_METHOD("restart"), &CPUParticles3D::restart);
+	ClassDB::bind_method(D_METHOD("capture_aabb"), &CPUParticles3D::capture_aabb);
 
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "emitting"), "set_emitting", "is_emitting");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "amount", PROPERTY_HINT_RANGE, "1,1000000,1,exp"), "set_amount", "get_amount");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "emitting", PROPERTY_HINT_ONESHOT), "set_emitting", "is_emitting");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "amount", PROPERTY_HINT_RANGE, "1,1000000,1,exp"), "set_amount", "get_amount"); // FIXME: Evaluate support for `exp` in integer properties, or remove this.
 	ADD_GROUP("Time", "");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "lifetime", PROPERTY_HINT_RANGE, "0.01,600.0,0.01,or_greater,exp,suffix:s"), "set_lifetime", "get_lifetime");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "one_shot"), "set_one_shot", "get_one_shot");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "preprocess", PROPERTY_HINT_RANGE, "0.00,600.0,0.01,exp,suffix:s"), "set_pre_process_time", "get_pre_process_time");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "preprocess", PROPERTY_HINT_RANGE, "0.00,10.0,0.01,or_greater,exp,suffix:s"), "set_pre_process_time", "get_pre_process_time");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "speed_scale", PROPERTY_HINT_RANGE, "0,64,0.01"), "set_speed_scale", "get_speed_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "explosiveness", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_explosiveness_ratio", "get_explosiveness_ratio");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "randomness", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_randomness_ratio", "get_randomness_ratio");
@@ -1461,6 +1497,7 @@ void CPUParticles3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "fixed_fps", PROPERTY_HINT_RANGE, "0,1000,1,suffix:FPS"), "set_fixed_fps", "get_fixed_fps");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "fract_delta"), "set_fractional_delta", "get_fractional_delta");
 	ADD_GROUP("Drawing", "");
+	ADD_PROPERTY(PropertyInfo(Variant::AABB, "visibility_aabb", PROPERTY_HINT_NONE, "suffix:m"), "set_visibility_aabb", "get_visibility_aabb");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "local_coords"), "set_use_local_coordinates", "get_use_local_coordinates");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "draw_order", PROPERTY_HINT_ENUM, "Index,Lifetime,View Depth"), "set_draw_order", "get_draw_order");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "mesh", PROPERTY_HINT_RESOURCE_TYPE, "Mesh"), "set_mesh", "get_mesh");
@@ -1531,6 +1568,9 @@ void CPUParticles3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_emission_ring_inner_radius", "inner_radius"), &CPUParticles3D::set_emission_ring_inner_radius);
 	ClassDB::bind_method(D_METHOD("get_emission_ring_inner_radius"), &CPUParticles3D::get_emission_ring_inner_radius);
 
+	ClassDB::bind_method(D_METHOD("set_emission_ring_cone_angle", "cone_angle"), &CPUParticles3D::set_emission_ring_cone_angle);
+	ClassDB::bind_method(D_METHOD("get_emission_ring_cone_angle"), &CPUParticles3D::get_emission_ring_cone_angle);
+
 	ClassDB::bind_method(D_METHOD("get_gravity"), &CPUParticles3D::get_gravity);
 	ClassDB::bind_method(D_METHOD("set_gravity", "accel_vec"), &CPUParticles3D::set_gravity);
 
@@ -1558,9 +1598,10 @@ void CPUParticles3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_VECTOR3_ARRAY, "emission_normals"), "set_emission_normals", "get_emission_normals");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_COLOR_ARRAY, "emission_colors"), "set_emission_colors", "get_emission_colors");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "emission_ring_axis"), "set_emission_ring_axis", "get_emission_ring_axis");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "emission_ring_height"), "set_emission_ring_height", "get_emission_ring_height");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "emission_ring_radius"), "set_emission_ring_radius", "get_emission_ring_radius");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "emission_ring_inner_radius"), "set_emission_ring_inner_radius", "get_emission_ring_inner_radius");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "emission_ring_height", PROPERTY_HINT_RANGE, "0,1000,0.01,or_greater"), "set_emission_ring_height", "get_emission_ring_height");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "emission_ring_radius", PROPERTY_HINT_RANGE, "0,1000,0.01,or_greater"), "set_emission_ring_radius", "get_emission_ring_radius");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "emission_ring_inner_radius", PROPERTY_HINT_RANGE, "0,1000,0.01,or_greater"), "set_emission_ring_inner_radius", "get_emission_ring_inner_radius");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "emission_ring_cone_angle", PROPERTY_HINT_RANGE, "0,90,0.01,degrees"), "set_emission_ring_cone_angle", "get_emission_ring_cone_angle");
 	ADD_GROUP("Particle Flags", "particle_flag_");
 	ADD_PROPERTYI(PropertyInfo(Variant::BOOL, "particle_flag_align_y"), "set_particle_flag", "get_particle_flag", PARTICLE_FLAG_ALIGN_Y_TO_VELOCITY);
 	ADD_PROPERTYI(PropertyInfo(Variant::BOOL, "particle_flag_rotate_y"), "set_particle_flag", "get_particle_flag", PARTICLE_FLAG_ROTATE_Y);
@@ -1697,6 +1738,7 @@ CPUParticles3D::CPUParticles3D() {
 	set_emission_ring_height(1);
 	set_emission_ring_radius(1);
 	set_emission_ring_inner_radius(0);
+	set_emission_ring_cone_angle(90);
 
 	set_gravity(Vector3(0, -9.8, 0));
 
